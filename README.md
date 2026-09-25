@@ -80,23 +80,34 @@ Server **不依赖**任何客户端代码；客户端**不引用** Server 的实
 
 | 项 | 状态 |
 |---|---|
-| .NET SDK | ❌ **本机未安装**（不在 PATH，`C:\Program Files\dotnet` 不存在）→ Phase 2 的第一个动作就是安装 .NET 10 LTS |
+| .NET SDK | ✅ **10.0.401**，装在 `D:\Windows\Apps\DSH_Tools\dotnet\dotnet.exe`（2026-09-26 用官方 `dotnet-install.ps1 -Channel 10.0 -NoPath` 装的 per-user 版本，**没有改 PATH**，所以下面一律给全路径） |
 | Git / GitHub CLI | ✅ 可用 |
 | Visual Studio 生成工具 | ✅ 已装（供 C++ 用；C# 只需 SDK） |
 
-## 8. 当前状态（Phase 0 · 骨架）
+### 构建与测试（本机命令，照抄即可）
 
-Phase 0 明确**不写产品代码**，所以本仓库现在只有边界文档与目录骨架：
+```powershell
+$dotnet = 'D:\Windows\Apps\DSH_Tools\dotnet\dotnet.exe'
+cd D:\ZCode\QuizSyncServer
+& $dotnet build -v q          # 警告即错误（Directory.Build.props）
+& $dotnet test  --nologo      # 回环集成测试：起真 Host、打真 HTTP
+& $dotnet run --project src\QuizSync.Server.Cli -- --doctor   # 启动自检
+```
+
+## 8. 当前状态（Phase 2 · 起步）
 
 - [x] 仓库与目录骨架
 - [x] `README.md` / `CONTRIBUTING.md`：职责、绝不放入什么、依赖方向、版本规则
-- [ ] Phase 2：Kestrel 宿主 + `/api/v2/*` + `/api/v1/*` 兼容层 + `/ws`
+- [x] Phase 2：Kestrel 宿主（端口 8765 + 向上探测 6 个、绑定 `0.0.0.0`、端口 0 = 系统分配）+ `/health`
+- [x] Phase 2：`/api/v2/info` 与 `/api/v1/info` 兼容层（各自的 `protocol_version` 与字段形态）
+- [x] Phase 2：CLI 参数解析（`--port/--bind/--data/--doctor/--version/--help`）+ 分层纪律（Core 不读 argv、不写控制台）
 - [ ] Phase 2：配对 / 设备 / 令牌 / 角色 / 限流 / 锁定
 - [ ] Phase 2：Blob 存储（流式限长、内容寻址、下载路径白名单）
 - [ ] Phase 2：任务队列（幂等、结果复用）+ 识别任务派发
 - [ ] Phase 2：op 中继与水位、快照分页
+- [ ] Phase 2：`/ws`
 - [ ] Phase 2：CLI 全命令集 + `setup` 向导 + `doctor`
-- [ ] CI：`dotnet build` + `dotnet test` + 一致性向量回放
+- [ ] CI：`dotnet build` + `dotnet test` + 一致性向量回放（一致性向量回放器是 Phase 2 的验收手段）
 
 一致性向量与规范在 [QuizSyncProtocol](https://github.com/iop666/QuizSyncProtocol)；**向量是实现的唯一裁判**。
 
