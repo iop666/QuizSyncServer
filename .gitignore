@@ -1,0 +1,13 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+TestResults/
+artifacts/
+dist/
+
+# 运行期数据（config/state/images/logs/runtime.json，绝不入仓）
+/QuizSyncServer/
+*.log
