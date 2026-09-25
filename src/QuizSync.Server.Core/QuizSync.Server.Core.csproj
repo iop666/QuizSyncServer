@@ -5,5 +5,8 @@
     <!-- Core 自己承载 HTTP 宿主（内嵌 Kestrel）：它既被 CLI 加载，也会被桌面端进程内嵌。 -->
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+  </ItemGroup>
 
 </Project>
