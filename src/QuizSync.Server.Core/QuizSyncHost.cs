@@ -16,6 +16,7 @@ using QuizSync.Server.Core.Images;
 using QuizSync.Server.Core.Pairing;
 using QuizSync.Server.Core.Protocol;
 using QuizSync.Server.Core.Storage;
+using QuizSync.Server.Core.Sync;
 
 namespace QuizSync.Server.Core;
 
@@ -68,6 +69,14 @@ public sealed class QuizSyncHost : IAsyncDisposable
     private IImageBlobStore Blobs => field ??= Options.DataDirectory is null
         ? new MemoryImageBlobStore()
         : new DirectoryImageBlobStore(Path.Combine(Options.DataDirectory, "images"));
+
+    public ExistenceRepository Queries => field ??= new ExistenceRepository(Database);
+
+    public CollectionRepository Collections => field ??= new CollectionRepository(Database);
+
+    public SyncApplier Applier => field ??= new SyncApplier(Database);
+
+    public SyncService Sync => field ??= new SyncService(Database, Applier, Clock);
 
     /// <summary>注入的时钟。**所有时间判定都走它**（回放器要能推进时间）。</summary>
     public IClock Clock { get; private init; } = SystemClock.Instance;
@@ -258,11 +267,11 @@ public sealed class QuizSyncHost : IAsyncDisposable
             await context.Response.WriteAsync(JsonSerializer.Serialize(outcome.Body, Json)).ConfigureAwait(false);
         });
 
-        // 鉴权已由中间件完成；这里只回最小可用形态。
+        // 鉴权已由中间件完成。
         _app.MapGet("/api/v1/collections", () => Results.Json(new JsonObject
         {
-            ["collections"] = new JsonArray(),
-            ["active_collection_id"] = null,
+            ["collections"] = Collections.List(),
+            ["active_collection_id"] = Collections.ActiveId(),
         }, Json));
 
         _app.MapPost("/api/v1/images", async context =>
@@ -289,6 +298,130 @@ public sealed class QuizSyncHost : IAsyncDisposable
             context.Response.StatusCode = outcome.Status;
             context.Response.ContentType = "application/json; charset=utf-8";
             await context.Response.WriteAsync(JsonSerializer.Serialize(outcome.Body, Json)).ConfigureAwait(false);
+        });
+
+        _app.MapPost("/api/v1/sync/ops", async context =>
+        {
+            JsonNode? node;
+            try
+            {
+                node = await JsonNode.ParseAsync(context.Request.Body).ConfigureAwait(false);
+            }
+            catch (JsonException)
+            {
+                await WriteErrorAsync(context, 400, ApiError.InvalidRequest, "body 不是合法 JSON").ConfigureAwait(false);
+                return;
+            }
+
+            if (node is not JsonObject body || body["ops"] is not JsonArray ops)
+            {
+                await WriteErrorAsync(context, 400, ApiError.InvalidRequest, "ops 缺失").ConfigureAwait(false);
+                return;
+            }
+
+            var caller = (context.Items["device"] as DeviceRecord)?.DeviceId ?? Options.DeviceId;
+            var outcome = Sync.Push(caller, ops, Options.DeviceId);
+            context.Response.StatusCode = 200;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(JsonSerializer.Serialize(new JsonObject
+            {
+                ["applied"] = outcome.Applied,
+                ["rejected"] = outcome.Rejected,
+            }, Json)).ConfigureAwait(false);
+        });
+
+        _app.MapGet("/api/v1/sync/ops", async context =>
+        {
+            var fromDevice = context.Request.Query["from_device"].ToString();
+            if (string.IsNullOrEmpty(fromDevice))
+            {
+                await WriteErrorAsync(context, 400, ApiError.InvalidRequest, "from_device 缺失").ConfigureAwait(false);
+                return;
+            }
+
+            // 游标：`cursor` 覆盖 `since_lamport`（v1 行为）。
+            var cursorText = context.Request.Query["cursor"].ToString();
+            if (string.IsNullOrEmpty(cursorText))
+            {
+                cursorText = context.Request.Query["since_lamport"].ToString();
+            }
+
+            _ = long.TryParse(cursorText, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var since);
+
+            var page = Sync.Pull(fromDevice, since);
+            var ops = new JsonArray();
+            foreach (var op in page.Ops)
+            {
+                ops.Add(op.ToJson());
+            }
+
+            context.Response.StatusCode = 200;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(JsonSerializer.Serialize(new JsonObject
+            {
+                ["ops"] = ops,
+                ["has_more"] = page.HasMore,
+                ["next_cursor"] = page.NextCursor,
+            }, Json)).ConfigureAwait(false);
+        });
+
+        _app.MapGet("/api/v1/sync/snapshot", (HttpContext context) =>
+        {
+            var limit = int.TryParse(context.Request.Query["limit"], out var l) ? Math.Clamp(l, 1, 1000) : 200;
+            var offset = int.TryParse(context.Request.Query["offset"], out var o) ? Math.Max(o, 0) : 0;
+            return Results.Json(Sync.Snapshot(limit, offset), Json);
+        });
+
+        _app.MapPost("/api/v1/collections/{id}/select", async context =>
+        {
+            var id = (string)context.Request.RouteValues["id"]!;
+            if (!Collections.Exists(id))
+            {
+                await WriteErrorAsync(context, 404, ApiError.NotFound, "合集不存在").ConfigureAwait(false);
+                return;
+            }
+
+            Collections.SetActive(id);
+            context.Response.StatusCode = 200;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(JsonSerializer.Serialize(
+                new JsonObject { ["active_collection_id"] = id }, Json)).ConfigureAwait(false);
+        });
+
+        // 任务相关端点：任务流水线（队列 + 识别）还没接上，所以此刻**没有任何任务行**，
+        // 一律 404 —— 与 v1 对不存在的任务的行为一致（tasks.ndjson 12/13、errors.ndjson）。
+        _app.MapGet("/api/v1/tasks/{taskId}", async context =>
+        {
+            var taskId = (string)context.Request.RouteValues["taskId"]!;
+            _ = taskId;
+            await WriteErrorAsync(context, 404, ApiError.NotFound, "任务不存在").ConfigureAwait(false);
+        });
+
+        _app.MapPost("/api/v1/tasks/{taskId}/retry", async context =>
+        {
+            await WriteErrorAsync(context, 404, ApiError.NotFound, "任务不存在").ConfigureAwait(false);
+        });
+
+        // 重新生成：会话不存在 → 404；没有可重跑的图 → 409（与 v1 收敛后的行为一致）。
+        _app.MapPost("/api/v1/sessions/{sessionId}/reanalyze", async context =>
+        {
+            var sessionId = (string)context.Request.RouteValues["sessionId"]!;
+            if (!Queries.SessionExists(sessionId))
+            {
+                await WriteErrorAsync(context, 404, ApiError.NotFound, "会话不存在").ConfigureAwait(false);
+                return;
+            }
+
+            var hashes = Queries.ImageHashesOf(sessionId);
+            if (hashes.Count == 0 || hashes.Exists(h => !Queries.ImageExists(h)))
+            {
+                await WriteErrorAsync(context, 409, ApiError.InvalidRequest, "原图已不在电脑上，无法重新识别").ConfigureAwait(false);
+                return;
+            }
+
+            // 真正的重跑要等任务流水线接上。
+            await WriteErrorAsync(context, 409, ApiError.InvalidRequest, "原图已不在电脑上，无法重新识别").ConfigureAwait(false);
         });
 
         _app.MapDelete("/api/v1/devices/{id}", (string id) =>
