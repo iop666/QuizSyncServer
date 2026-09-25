@@ -1,0 +1,68 @@
+name: CI（.NET 构建 / 格式 / 测试；还没有工程文件时跳过）
+
+# 本仓库用 hashFiles 探测 *.sln / *.slnx / *.csproj：
+#   有工程文件 → 装 .NET 10 SDK → dotnet build / format --verify-no-changes / test；
+#   没有（Phase 0 那种「只有 README 与占位目录」的状态）→ 打印一行跳过并**成功退出**。
+# 两条分支都成立，所以以后加/减工程都不用改本文件。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支/PR 的新推送取消旧运行
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dotnet:
+    name: .NET 构建与测试
+    runs-on: windows-latest # 目标形态是 Windows 上的 CLI 与可内嵌库
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 探测 .NET 工程文件
+        id: probe
+        shell: bash
+        # hashFiles 判断「仓库里有没有工程文件」；顺带挑一个目标：优先解决方案
+        # （.sln / .slnx —— dotnet test 会自动跳过里面的非测试工程），没有才退化到第一个 .csproj。
+        run: |
+          if [ -n "${{ hashFiles('**/*.sln', '**/*.slnx', '**/*.csproj') }}" ]; then
+            target="$(find . -path ./.git -prune -o \( -name '*.sln' -o -name '*.slnx' \) -print | sort | sed -n '1p')"
+            if [ -z "$target" ]; then
+              target="$(find . -path ./.git -prune -o -name '*.csproj' -print | sort | sed -n '1p')"
+            fi
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "target=$target" >> "$GITHUB_OUTPUT"
+            echo "找到工程文件：$target"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::仓库里还没有 *.sln / *.slnx / *.csproj，跳过 .NET 构建、格式检查与测试（成功）"
+          fi
+
+      - name: 安装 .NET SDK
+        if: steps.probe.outputs.found == 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x # README 第 7 节：Phase 2 起用 .NET 10 LTS
+
+      - name: 构建
+        if: steps.probe.outputs.found == 'true'
+        shell: bash
+        run: dotnet build "${{ steps.probe.outputs.target }}" --configuration Release
+
+      - name: 格式检查
+        if: steps.probe.outputs.found == 'true'
+        shell: bash
+        run: dotnet format "${{ steps.probe.outputs.target }}" --verify-no-changes
+
+      - name: 测试
+        if: steps.probe.outputs.found == 'true'
+        shell: bash
+        run: dotnet test "${{ steps.probe.outputs.target }}" --configuration Release --no-build
+
+      - name: 无工程文件 → 跳过
+        if: steps.probe.outputs.found != 'true'
+        run: echo "本仓库暂无 *.sln / *.slnx / *.csproj：CI 跳过 .NET 步骤并成功退出。"

@@ -12,6 +12,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using QuizSync.Server.Core.Auth;
+using QuizSync.Server.Core.Images;
 using QuizSync.Server.Core.Pairing;
 using QuizSync.Server.Core.Protocol;
 using QuizSync.Server.Core.Storage;
@@ -54,6 +55,19 @@ public sealed class QuizSyncHost : IAsyncDisposable
     });
 
     public BearerAuthenticator Authenticator => field ??= new BearerAuthenticator(Devices);
+
+    public ImageRepository Images2 => field ??= new ImageRepository(Database);
+
+    /// <summary>图片上传/下载。字节存放：给过数据目录就用磁盘，否则内存（测试）。</summary>
+    public ImageService Images => field ??= new ImageService(
+        Images2,
+        Blobs,
+        Clock,
+        new ImageOptions());
+
+    private IImageBlobStore Blobs => field ??= Options.DataDirectory is null
+        ? new MemoryImageBlobStore()
+        : new DirectoryImageBlobStore(Path.Combine(Options.DataDirectory, "images"));
 
     /// <summary>注入的时钟。**所有时间判定都走它**（回放器要能推进时间）。</summary>
     public IClock Clock { get; private init; } = SystemClock.Instance;
@@ -250,6 +264,32 @@ public sealed class QuizSyncHost : IAsyncDisposable
             ["collections"] = new JsonArray(),
             ["active_collection_id"] = null,
         }, Json));
+
+        _app.MapPost("/api/v1/images", async context =>
+        {
+            var uploader = (context.Items["device"] as DeviceRecord)?.DeviceId ?? Options.DeviceId;
+            var outcome = await Images.UploadAsync(context, uploader, context.RequestAborted).ConfigureAwait(false);
+            context.Response.StatusCode = outcome.Status;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(JsonSerializer.Serialize(outcome.Body, Json)).ConfigureAwait(false);
+        });
+
+        _app.MapGet("/api/v1/images/{hash}", async context =>
+        {
+            var hash = (string)context.Request.RouteValues["hash"]!;
+            var outcome = Images.Download(hash);
+            if (outcome.Bytes is not null)
+            {
+                context.Response.StatusCode = 200;
+                context.Response.ContentType = "image/jpeg";
+                await context.Response.Body.WriteAsync(outcome.Bytes, context.RequestAborted).ConfigureAwait(false);
+                return;
+            }
+
+            context.Response.StatusCode = outcome.Status;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(JsonSerializer.Serialize(outcome.Body, Json)).ConfigureAwait(false);
+        });
 
         _app.MapDelete("/api/v1/devices/{id}", (string id) =>
         {
