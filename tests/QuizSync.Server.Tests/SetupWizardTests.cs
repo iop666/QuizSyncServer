@@ -26,8 +26,35 @@ public sealed class SetupWizardTests
             : throw new FileNotFoundException($"测试输出目录里没有 CLI 产物：{path}");
     }
 
-    private static string Dotnet() => Environment.GetEnvironmentVariable("QS_DOTNET")
-        ?? throw new InvalidOperationException("请设置 QS_DOTNET 指向 dotnet 可执行文件");
+    /// <summary>
+    /// 优先 `QS_DOTNET`（本机 SDK 装在用户目录、没进 PATH 时用），否则退化到 PATH 里的 `dotnet`
+    /// —— CI 上 `setup-dotnet` 已经把 dotnet 放进 PATH 了，那里没有 QS_DOTNET。
+    /// （最初写成「必须有 QS_DOTNET」，于是本地绿、CI 红：5 条用例全在这个变量上崩。）
+    /// </summary>
+    private static string Dotnet()
+    {
+        var configured = Environment.GetEnvironmentVariable("QS_DOTNET");
+        if (!string.IsNullOrWhiteSpace(configured))
+        {
+            return configured;
+        }
+
+        try
+        {
+            using var probe = Process.Start(new ProcessStartInfo("dotnet")
+            {
+                ArgumentList = { "--version" },
+                RedirectStandardOutput = true,
+            })!;
+            probe.WaitForExit(5000);
+            return "dotnet";
+        }
+        catch (Exception error) when (error is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            throw new InvalidOperationException(
+                "PATH 里找不到 dotnet，也没设置 QS_DOTNET —— 两条路至少给一条。", error);
+        }
+    }
 
     private static (string Output, int ExitCode) RunCli(params string[] args)
     {
