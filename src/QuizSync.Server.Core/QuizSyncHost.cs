@@ -275,13 +275,20 @@ public sealed class QuizSyncHost : IAsyncDisposable
 
             var path = context.Request.Path.Value ?? string.Empty;
 
-            // v1 只豁免这两个路径（`/ws` 走自己的握手鉴权，不经过这里做版本协商）。
+            // v1 只豁免这几个路径（`/ws` 走自己的握手鉴权，不经过这里做版本协商）。
             // 本机控制面（`/api/v1/pair/code*`）也不是 LAN 协议：它由**控制令牌**把关，
             // 不要求设备 Bearer（否则 CLI 得先配对才能读配对码，死循环）。
-            var exempt = path is "/api/v1/pair" or "/api/v1/info" or "/health"
+            // `/api/v2/info` 与 v1 的 `/info` 同级，同样免鉴权（客户端靠它做版本协商）。
+            var exempt = path is "/api/v1/pair" or "/api/v1/info" or "/api/v2/info" or "/health"
                 or "/api/v1/pair/code" or "/api/v1/pair/code/refresh";
 
-            if (!exempt && path.StartsWith("/api/v1/", StringComparison.Ordinal))
+            // ⚠️ 鉴权必须覆盖**所有** API 版本：原来只判 `/api/v1/` 前缀，
+            // 于是 `/api/v2/*` 整段绕过鉴权（未配对的局域网设备能直接拉同步 op）——
+            // v2 的拉取用例第一次跑就把这条抓出来了。
+            var isApi = path.StartsWith("/api/v1/", StringComparison.Ordinal)
+                || path.StartsWith("/api/v2/", StringComparison.Ordinal);
+
+            if (!exempt && isApi)
             {
                 var auth = Authenticator.Authenticate(context.Request.Headers.Authorization);
                 if (auth.Status is AuthStatus.Missing or AuthStatus.Invalid)
@@ -500,7 +507,21 @@ public sealed class QuizSyncHost : IAsyncDisposable
             }
 
             var caller = (context.Items["device"] as DeviceRecord)?.DeviceId ?? Options.DeviceId;
-            var outcome = Sync.Push(caller, ops, Options.DeviceId);
+
+            // 落库失败要变成**协议错误**而不是 500：op 里少了「NOT NULL 且无默认值」的列
+            // （例如 questions 的 session_id / ordinal / type）时，SQLite 会抛约束异常。
+            // 客户端拿到 400 + 原因才能自救；给个 500 只能两眼一抹黑。
+            PushOutcome outcome;
+            try
+            {
+                outcome = Sync.Push(caller, ops, Options.DeviceId);
+            }
+            catch (Exception error) when (error is Microsoft.Data.Sqlite.SqliteException or InvalidOperationException or ArgumentException)
+            {
+                await WriteErrorAsync(context, 400, ApiError.InvalidRequest, $"op 无法落地：{error.Message}").ConfigureAwait(false);
+                return;
+            }
+
             context.Response.StatusCode = 200;
             context.Response.ContentType = "application/json; charset=utf-8";
             await context.Response.WriteAsync(JsonSerializer.Serialize(new JsonObject
@@ -530,6 +551,44 @@ public sealed class QuizSyncHost : IAsyncDisposable
                 System.Globalization.CultureInfo.InvariantCulture, out var since);
 
             var page = Sync.Pull(fromDevice, since);
+            var ops = new JsonArray();
+            foreach (var op in page.Ops)
+            {
+                ops.Add(op.ToJson());
+            }
+
+            context.Response.StatusCode = 200;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(JsonSerializer.Serialize(new JsonObject
+            {
+                ["ops"] = ops,
+                ["has_more"] = page.HasMore,
+                ["next_cursor"] = page.NextCursor,
+            }, Json)).ConfigureAwait(false);
+        });
+
+        // v2：`since_lamport` 与 `cursor` **收敛为单一游标参数**（见 spec/04 第 6 条）。
+        // 老参数不再静默忽略 —— 明确报错，否则客户端会以为自己在用 v1 语义。
+        _app.MapGet("/api/v2/sync/ops", async context =>
+        {
+            if (!string.IsNullOrEmpty(context.Request.Query["since_lamport"].ToString()))
+            {
+                await WriteErrorAsync(context, 400, ApiError.InvalidRequest,
+                    "v2 用 cursor；since_lamport 已废弃").ConfigureAwait(false);
+                return;
+            }
+
+            var fromDevice = context.Request.Query["from_device"].ToString();
+            if (string.IsNullOrEmpty(fromDevice))
+            {
+                await WriteErrorAsync(context, 400, ApiError.InvalidRequest, "from_device 缺失").ConfigureAwait(false);
+                return;
+            }
+
+            _ = long.TryParse(context.Request.Query["cursor"].ToString(), System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var cursor);
+
+            var page = Sync.Pull(fromDevice, cursor);
             var ops = new JsonArray();
             foreach (var op in page.Ops)
             {
