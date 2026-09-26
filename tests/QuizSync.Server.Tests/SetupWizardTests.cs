@@ -58,7 +58,14 @@ public sealed class SetupWizardTests
 
     private static (string Output, int ExitCode) RunCli(params string[] args)
     {
-        var info = new ProcessStartInfo(Dotnet()) { RedirectStandardOutput = true, RedirectStandardError = true };
+        var info = new ProcessStartInfo(Dotnet())
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            // 明确按 UTF-8 读：CLI 的中文输出走 UTF-8，别让测试按控制台代码页解。
+            StandardOutputEncoding = System.Text.Encoding.UTF8,
+            StandardErrorEncoding = System.Text.Encoding.UTF8,
+        };
         info.ArgumentList.Add(CliDll());
         foreach (var arg in args)
         {

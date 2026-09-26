@@ -22,6 +22,17 @@ var options = new ServerOptions
     DataDirectory = parsed.DataDirectory,
 };
 
+// 中文输出必须显式设成 UTF-8：默认跟随控制台代码页，CI runner 上会变成 ??????
+// （实测：本地绿、CI 红的 5 条用例全是这个原因 —— 断言里的中文子串在子进程输出里不存在了）。
+try
+{
+    Console.OutputEncoding = System.Text.Encoding.UTF8;
+}
+catch (IOException)
+{
+    // 没有控制台（被重定向到管道）时可能抛，忽略即可。
+}
+
 var dataDir = parsed.DataDirectory ?? Path.Combine(AppContext.BaseDirectory, "userdata");
 
 // 免数据目录的命令：`version` / `help` 不该有副作用；
