@@ -76,22 +76,19 @@ Server **不依赖**任何客户端代码；客户端**不引用** Server 的实
 - 升级：Server 只随**协议版本**升级；升级前自动备份 `state.json`；**不自动更新**。
 - 旧数据迁移：从旧 Dart 版服务端目录（`config.json` / `state.json` / `images`）一次性迁移，`doctor` 检测并提示。
 
-## 7. 前置（本机现状 · 实测）
+## 7. 前置
 
 | 项 | 状态 |
 |---|---|
-| .NET SDK | ✅ **10.0.401**，装在 `D:\Windows\Apps\DSH_Tools\dotnet\dotnet.exe`（2026-09-26 用官方 `dotnet-install.ps1 -Channel 10.0 -NoPath` 装的 per-user 版本，**没有改 PATH**，所以下面一律给全路径） |
-| Git / GitHub CLI | ✅ 可用 |
-| Visual Studio 生成工具 | ✅ 已装（供 C++ 用；C# 只需 SDK） |
+| .NET SDK | **10.0.x**（`dotnet --version` 能打印即可）。开发机上若装的是 per-user 版本、没进 PATH，用它的绝对路径调用即可 —— 本文件不写死任何机器路径 |
+| Git / GitHub CLI | 可选（提交与发布用） |
 
-### 构建与测试（本机命令，照抄即可）
+### 构建与测试
 
 ```powershell
-$dotnet = 'D:\Windows\Apps\DSH_Tools\dotnet\dotnet.exe'
-cd D:\ZCode\QuizSyncServer
-& $dotnet build -v q          # 警告即错误（Directory.Build.props）
-& $dotnet test  --nologo      # 回环集成测试：起真 Host、打真 HTTP
-& $dotnet run --project src\QuizSync.Server.Cli -- --doctor   # 启动自检
+dotnet build -v q          # 警告即错误（Directory.Build.props）
+dotnet test  --nologo      # 回环集成测试：起真 Host、打真 HTTP
+dotnet run --project src\QuizSync.Server.Cli -- --doctor   # 启动自检
 ```
 
 ## 8. 当前状态（Phase 2 · 起步）
