@@ -23,6 +23,14 @@ jobs:
       - name: 检出仓库
         uses: actions/checkout@v4
 
+      # 一致性向量只存在于公开协议仓，本仓不留副本；用 QS_VECTORS 指过去
+      # （回放器找不到向量会**明确失败**，不静默跳过）。
+      - name: 检出 QuizSyncProtocol（向量来源）
+        uses: actions/checkout@v4
+        with:
+          repository: iop666/QuizSyncProtocol
+          path: QuizSyncProtocol
+
       - name: 探测 .NET 工程文件
         id: probe
         shell: bash
@@ -61,6 +69,9 @@ jobs:
       - name: 测试
         if: steps.probe.outputs.found == 'true'
         shell: bash
+        env:
+          # 向量在刚检出的协议仓里；回放器读这个变量，读不到就失败（不静默跳过）
+          QS_VECTORS: ${{ github.workspace }}/QuizSyncProtocol/conformance/vectors
         run: dotnet test "${{ steps.probe.outputs.target }}" --configuration Release --no-build
 
       - name: 无工程文件 → 跳过
