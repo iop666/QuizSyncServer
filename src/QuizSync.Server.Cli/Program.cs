@@ -23,7 +23,15 @@ var options = new ServerOptions
 };
 
 var dataDir = parsed.DataDirectory ?? Path.Combine(AppContext.BaseDirectory, "userdata");
-var controlToken = ReadOrCreateControlToken(dataDir);
+
+// 免数据目录的命令：`version` / `help` 不该有副作用；
+// `setup` 不带 `--apply` 时是 **dry-run** —— 只打印计划，绝不能把目录建出来
+// （这条是 `SetupWizardTests.Dry_run_prints_the_plan_and_changes_nothing` 抓出来的：
+//  原来无条件建目录，等于「想看一眼却把环境改了」）。
+var touchesData = parsed.Command is not ("version" or "help")
+    && !(parsed.Command == "setup" && !parsed.Apply)
+    && !parsed.ShowHelp;
+var controlToken = touchesData ? ReadOrCreateControlToken(dataDir) : string.Empty;
 
 switch (parsed.Command)
 {
@@ -149,6 +157,74 @@ switch (parsed.Command)
             return 0;
         }
 
+    case "setup":
+        {
+            // 向导：**默认只打印计划（dry-run）**，`--apply` 才落盘。
+            // 一台真机上第一次跑，最怕的就是「想看一眼却把环境改了」。
+            var port = options.PreferredPort;
+            var bind = options.BindAddress;
+            var databasePath = Path.Combine(dataDir, "quizsync.db");
+
+            var steps = new List<(string Action, string Detail)>
+            {
+                ("确保数据目录存在", dataDir),
+                ("写入端口与绑定地址", $"pairing.port = {port}；bind = {bind}"),
+                ("初始化库（表结构与协议 schema 一致）", databasePath),
+            };
+
+            if (parsed.Json)
+            {
+                var stepsJson = new System.Text.Json.Nodes.JsonArray();
+                foreach (var (action, detail) in steps)
+                {
+                    stepsJson.Add(new JsonObject { ["action"] = action, ["detail"] = detail });
+                }
+
+                Console.WriteLine(new JsonObject
+                {
+                    ["applied"] = parsed.Apply,
+                    ["data_dir"] = dataDir,
+                    ["port"] = port,
+                    ["bind"] = bind,
+                    ["steps"] = stepsJson,
+                }.ToJsonString());
+            }
+            else
+            {
+                Console.WriteLine(parsed.Apply ? "将执行以下步骤：" : "计划（dry-run，加 --apply 才会真的做）：");
+                foreach (var (action, detail) in steps)
+                {
+                    Console.WriteLine($"  · {action}：{detail}");
+                }
+
+                if (!parsed.Apply)
+                {
+                    Console.WriteLine("落盘后请执行：QuizSync.Server.Cli pair   # 生成配对码，供手机扫码");
+                }
+            }
+
+            if (!parsed.Apply)
+            {
+                return 0;
+            }
+
+            Directory.CreateDirectory(dataDir);
+            using (var database = QuizSyncDatabase.Open(databasePath))
+            {
+                var store = new DeviceRepository(database);
+                store.SetSetting("pairing.port", port.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                store.SetSetting("pairing.bind", bind);
+            }
+
+            if (!parsed.Json)
+            {
+                Console.WriteLine($"已就绪：{dataDir}");
+                Console.WriteLine("下一步：run 启动服务端；pair 生成配对码。");
+            }
+
+            return 0;
+        }
+
     case "doctor":
         {
             var checks = new List<(string Name, bool Ok, string Detail)>
@@ -263,6 +339,7 @@ internal sealed record CliArgs(
     string? DataDirectory,
     bool Doctor,
     bool Json,
+    bool Apply,
     bool ShowHelp)
 {
     public const string HelpText = """
@@ -272,6 +349,7 @@ internal sealed record CliArgs(
 
         命令：
           run                 前台运行（默认）
+          setup [--apply]     首次配置向导（默认 dry-run，只打印计划）
           doctor              自检：数据目录 / 本地库 / 监听 / 配对码
           pair                读正在运行的实例的配对码（含配对链接与有效期）
           devices [list]      列出已配对设备
@@ -287,6 +365,7 @@ internal sealed record CliArgs(
           --bind <addr>   绑定地址（默认 0.0.0.0，即局域网可连）
           --data <dir>    数据目录（库 / 图片 / 日志 / control.token）
           --json          机器可读输出（脚本用）
+          --apply         setup 真的落盘（不加则只打印计划）
           --doctor        等价于 doctor 命令
           --version       等价于 version 命令
           -h, --help      显示本帮助
@@ -299,6 +378,7 @@ internal sealed record CliArgs(
         string? bind = null;
         string? data = null;
         var doctor = false;
+        var apply = false;
         var json = false;
         var help = false;
 
@@ -334,6 +414,11 @@ internal sealed record CliArgs(
         }
 
         var command = positional.Count > 0 ? positional[0] : "run";
+        if (args.Contains("--apply"))
+        {
+            apply = true;
+        }
+
         if (doctor)
         {
             command = "doctor";
@@ -348,6 +433,7 @@ internal sealed record CliArgs(
             Bind: bind,
             DataDirectory: data,
             Doctor: doctor,
+            Apply: apply,
             Json: json,
             ShowHelp: help);
     }
