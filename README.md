@@ -101,13 +101,16 @@ cd D:\ZCode\QuizSyncServer
 - [x] Phase 2：Kestrel 宿主（端口 8765 + 向上探测 6 个、绑定 `0.0.0.0`、端口 0 = 系统分配）+ `/health`
 - [x] Phase 2：`/api/v2/info` 与 `/api/v1/info` 兼容层（各自的 `protocol_version` 与字段形态）
 - [x] Phase 2：CLI 参数解析（`--port/--bind/--data/--doctor/--version/--help`）+ 分层纪律（Core 不读 argv、不写控制台）
-- [ ] Phase 2：配对 / 设备 / 令牌 / 角色 / 限流 / 锁定
-- [ ] Phase 2：Blob 存储（流式限长、内容寻址、下载路径白名单）
-- [ ] Phase 2：任务队列（幂等、结果复用）+ 识别任务派发
-- [ ] Phase 2：op 中继与水位、快照分页
-- [ ] Phase 2：`/ws`
-- [ ] Phase 2：CLI 全命令集 + `setup` 向导 + `doctor`
-- [ ] CI：`dotnet build` + `dotnet test` + 一致性向量回放（一致性向量回放器是 Phase 2 的验收手段）
+- [x] Phase 2：配对 / 设备 / 令牌 / 限流 / 锁定（失败计数与锁定期**跨重启保留**）
+- [x] Phase 2：Blob 存储（流式限长两阶段、内容寻址、下载路径白名单、按设备限流）
+- [x] Phase 2：任务队列（串行执行、`task_id` 幂等、同图同页序复用、队列深度、失败码）
+- [x] Phase 2：op 中继与水位、逐字段 LWW、墓碑、快照分页
+- [x] Phase 2：`/ws`（hello、任务状态与结果、合集变更、吊销后主动断连、同设备踢旧）
+- [x] **一致性向量回放：6 组 120 步全绿**（auth / images / tasks / sync / errors / websocket；用本仓的 C# 回放器打真 HTTP + 真 WS）
+- [ ] Phase 2：CLI 全命令集（`pair`/`devices`/`config`/`status`/`doctor` 的完整输出）+ `setup` 向导
+- [ ] Phase 2：`/api/v2/*` 的真实 v2 语义（`X-QS-Protocol` 协商、gzip、NDJSON 分页）
+- [ ] Phase 2：Provider 派发（AI 归 Windows 客户端的 Provider 角色；Server 只派发与回传）
+- [ ] CI：工作流已就位但**推不上去**（凭据缺 `workflow` scope），暂存本地分支 `ci-pending`
 
 一致性向量与规范在 [QuizSyncProtocol](https://github.com/iop666/QuizSyncProtocol)；**向量是实现的唯一裁判**。
 
