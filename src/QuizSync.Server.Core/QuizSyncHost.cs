@@ -190,6 +190,14 @@ public sealed class QuizSyncHost : IAsyncDisposable
     {
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
+
+        // 响应压缩（v2 清单之一）：同步快照与分页在大库上会到几百 KB，
+        // 局域网里也值得压。**只压 JSON 且超过阈值**（小响应压了反而更慢）。
+        builder.Services.AddResponseCompression(compression =>
+        {
+            compression.EnableForHttps = false; // 局域网是明文 HTTP；开 HTTPS 压缩只会招来 BREACH 那类问题
+            compression.MimeTypes = ["application/json", "application/ndjson"];
+        });
         builder.WebHost.ConfigureKestrel(kestrel =>
         {
             kestrel.Listen(IPAddress.Parse(options.BindAddress), port);
@@ -232,6 +240,7 @@ public sealed class QuizSyncHost : IAsyncDisposable
     /// </summary>
     private void MapPipeline()
     {
+        _app.UseResponseCompression();
         _app.UseWebSockets();
 
         // 任务状态 → WS 广播（唯一出口，与 v1 的 `_emitTaskUpdate` 对齐）。
