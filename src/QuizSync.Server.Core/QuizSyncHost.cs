@@ -17,6 +17,7 @@ using QuizSync.Server.Core.Pairing;
 using QuizSync.Server.Core.Protocol;
 using QuizSync.Server.Core.Storage;
 using QuizSync.Server.Core.Sync;
+using QuizSync.Server.Core.Tasks;
 
 namespace QuizSync.Server.Core;
 
@@ -77,6 +78,19 @@ public sealed class QuizSyncHost : IAsyncDisposable
     public SyncApplier Applier => field ??= new SyncApplier(Database);
 
     public SyncService Sync => field ??= new SyncService(Database, Applier, Clock);
+
+    public TaskRepository TaskRows => field ??= new TaskRepository(Database);
+
+    public SessionRepository Sessions => field ??= new SessionRepository(Database);
+
+    public TaskService Tasks => field ??= new TaskService(
+        TaskRows, Sessions, Images2, Blobs, Collections, Analyzer, Clock, new TaskOptions());
+
+    /// <summary>
+    /// 识别器：默认是固定答案的 fixture（回放要**确定性**，不要真 AI）。
+    /// 真机上以后换成「派发给 Windows 客户端的 Provider」。
+    /// </summary>
+    public IAnalyzer Analyzer { get; init; } = new FixtureAnalyzer();
 
     /// <summary>注入的时钟。**所有时间判定都走它**（回放器要能推进时间）。</summary>
     public IClock Clock { get; private init; } = SystemClock.Instance;
@@ -389,39 +403,99 @@ public sealed class QuizSyncHost : IAsyncDisposable
                 new JsonObject { ["active_collection_id"] = id }, Json)).ConfigureAwait(false);
         });
 
-        // 任务相关端点：任务流水线（队列 + 识别）还没接上，所以此刻**没有任何任务行**，
-        // 一律 404 —— 与 v1 对不存在的任务的行为一致（tasks.ndjson 12/13、errors.ndjson）。
+        // 任务流水线：校验顺序、幂等、结果复用、队列深度、202 恒定语义。
+        _app.MapPost("/api/v1/tasks", async context =>
+        {
+            JsonObject body;
+            try
+            {
+                var node = await JsonNode.ParseAsync(context.Request.Body).ConfigureAwait(false);
+                if (node is not JsonObject obj)
+                {
+                    await WriteErrorAsync(context, 400, ApiError.InvalidRequest, "body 不是合法 JSON").ConfigureAwait(false);
+                    return;
+                }
+
+                body = obj;
+            }
+            catch (JsonException)
+            {
+                await WriteErrorAsync(context, 400, ApiError.InvalidRequest, "body 不是合法 JSON").ConfigureAwait(false);
+                return;
+            }
+
+            var caller = (context.Items["device"] as DeviceRecord)?.DeviceId ?? Options.DeviceId;
+            var outcome = Tasks.Submit(body, caller, Options.DeviceId);
+            context.Response.StatusCode = outcome.Status;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(JsonSerializer.Serialize(outcome.Body, Json)).ConfigureAwait(false);
+        });
+
+        _app.MapGet("/api/v1/tasks/active", () => Results.Json(new JsonObject
+        {
+            ["status"] = "idle",
+            ["task_id"] = null,
+            ["session_id"] = null,
+            ["image_count"] = 0,
+            ["updated_at"] = Clock.NowMs,
+            ["message"] = null,
+            ["active_collection_id"] = Collections.ActiveId(),
+            ["collections"] = Collections.List(),
+            ["ops_lamport"] = Sync.Watermark(),
+        }, Json));
+
         _app.MapGet("/api/v1/tasks/{taskId}", async context =>
         {
             var taskId = (string)context.Request.RouteValues["taskId"]!;
-            _ = taskId;
-            await WriteErrorAsync(context, 404, ApiError.NotFound, "任务不存在").ConfigureAwait(false);
+            var view = Tasks.TaskView(taskId);
+            if (view is null)
+            {
+                await WriteErrorAsync(context, 404, ApiError.NotFound, "任务不存在").ConfigureAwait(false);
+                return;
+            }
+
+            context.Response.StatusCode = 200;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(JsonSerializer.Serialize(view, Json)).ConfigureAwait(false);
         });
 
         _app.MapPost("/api/v1/tasks/{taskId}/retry", async context =>
         {
-            await WriteErrorAsync(context, 404, ApiError.NotFound, "任务不存在").ConfigureAwait(false);
+            var taskId = (string)context.Request.RouteValues["taskId"]!;
+            if (!Tasks.Retry(taskId))
+            {
+                await WriteErrorAsync(context, 404, ApiError.NotFound, "任务不存在").ConfigureAwait(false);
+                return;
+            }
+
+            context.Response.StatusCode = 200;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(JsonSerializer.Serialize(
+                new JsonObject { ["status"] = "queued" }, Json)).ConfigureAwait(false);
         });
 
-        // 重新生成：会话不存在 → 404；没有可重跑的图 → 409（与 v1 收敛后的行为一致）。
+        // 重新生成：会话不存在 → 404；没有可重跑的图 → 409；否则 202 + 新 task_id。
         _app.MapPost("/api/v1/sessions/{sessionId}/reanalyze", async context =>
         {
             var sessionId = (string)context.Request.RouteValues["sessionId"]!;
-            if (!Queries.SessionExists(sessionId))
+            var caller = (context.Items["device"] as DeviceRecord)?.DeviceId ?? Options.DeviceId;
+            var outcome = Tasks.Reanalyze(sessionId, caller);
+            if (outcome is null)
             {
                 await WriteErrorAsync(context, 404, ApiError.NotFound, "会话不存在").ConfigureAwait(false);
                 return;
             }
 
-            var hashes = Queries.ImageHashesOf(sessionId);
-            if (hashes.Count == 0 || hashes.Exists(h => !Queries.ImageExists(h)))
+            context.Response.StatusCode = outcome.Status;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            var body = outcome.Body;
+            // 重新生成的响应必须带新任务号（客户端靠它轮询）。
+            if (outcome.Status == 202 && body["task_id"] is null)
             {
-                await WriteErrorAsync(context, 409, ApiError.InvalidRequest, "原图已不在电脑上，无法重新识别").ConfigureAwait(false);
-                return;
+                body["task_id"] = null;
             }
 
-            // 真正的重跑要等任务流水线接上。
-            await WriteErrorAsync(context, 409, ApiError.InvalidRequest, "原图已不在电脑上，无法重新识别").ConfigureAwait(false);
+            await context.Response.WriteAsync(JsonSerializer.Serialize(body, Json)).ConfigureAwait(false);
         });
 
         _app.MapDelete("/api/v1/devices/{id}", (string id) =>

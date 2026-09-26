@@ -1,0 +1,380 @@
+using System.Text.Json.Nodes;
+using QuizSync.Server.Core.Images;
+using QuizSync.Server.Core.Protocol;
+using QuizSync.Server.Core.Storage;
+
+namespace QuizSync.Server.Core.Tasks;
+
+/// <summary>建任务的结果（成功走 202，失败带错误码）。</summary>
+public sealed record SubmitOutcome(int Status, JsonObject Body);
+
+/// <summary>
+/// 任务流水线（v1 语义，逐条对 <c>spec/08-tasks.md</c> 与 `tasks.ndjson`）：
+///
+/// - **校验顺序**：字段缺失 → 页数上限 6 → 页图必须先上传 → 合集（无/不存在 → 409）
+///   → 队列深度 20（429 `queue_full`，`retry_after_seconds` 固定 10）；
+/// - **`task_id` 幂等**：同一 id 再提一次直接回既有状态（不重复识别）；
+/// - **结果复用**：同 `image_hash` **且页序逐位相同**、且该会话已完成、且没带 `force_reanalyze`
+///   → 不复用则新建；复用时不重复调 AI；
+/// - **恒返回 202**，`cached = cached || status == 'done'`；
+/// - 队列**串行执行**（并发恒 1），失败落 `error_code`（`ai_auth` / `no_question_found` / `internal`）。
+/// </summary>
+public sealed class TaskService(
+    TaskRepository tasks,
+    SessionRepository sessions,
+    ImageRepository images,
+    IImageBlobStore blobs,
+    CollectionRepository collections,
+    IAnalyzer analyzer,
+    IClock clock,
+    TaskOptions options)
+{
+    private readonly TaskRepository _tasks = tasks;
+    private readonly SessionRepository _sessions = sessions;
+    private readonly ImageRepository _images = images;
+    private readonly IImageBlobStore _blobs = blobs;
+    private readonly CollectionRepository _collections = collections;
+    private readonly IAnalyzer _analyzer = analyzer;
+    private readonly IClock _clock = clock;
+    private readonly TaskOptions _options = options;
+    private int _running;
+
+    public SubmitOutcome Submit(JsonObject body, string callerDeviceId, string serverDeviceId) =>
+        SubmitCore(body, callerDeviceId, serverDeviceId, checkQueueDepth: true);
+
+    /// <summary>
+    /// 建任务的公共路径。<paramref name="checkQueueDepth"/> 只在 **HTTP 创建端点**上为 true：
+    /// 队列深度闸门是给「客户端连点」准备的；重新生成走执行器，不受它限制
+    /// （v1 行为，`tasks.ndjson` 14–16 就是这个组合）。
+    /// </summary>
+    private SubmitOutcome SubmitCore(
+        JsonObject body, string callerDeviceId, string serverDeviceId, bool checkQueueDepth)
+    {
+        var taskId = body["task_id"]?.ToString();
+        var imageHash = body["image_hash"]?.ToString();
+        if (string.IsNullOrEmpty(taskId) || string.IsNullOrEmpty(imageHash))
+        {
+            return Failure(400, ApiError.InvalidRequest, "task_id / image_hash 缺失");
+        }
+
+        // 多页：`image_hashes` 优先，否则退回单页。
+        var hashes = new List<string>();
+        if (body["image_hashes"] is JsonArray pageArray && pageArray.Count > 0)
+        {
+            foreach (var page in pageArray)
+            {
+                var hash = page?.ToString();
+                if (!string.IsNullOrEmpty(hash))
+                {
+                    hashes.Add(hash);
+                }
+            }
+        }
+
+        if (hashes.Count == 0)
+        {
+            hashes.Add(imageHash);
+        }
+
+        if (hashes.Count > _options.MaxPages)
+        {
+            return Failure(400, ApiError.TooManyPages, $"最多 {_options.MaxPages} 页");
+        }
+
+        foreach (var hash in hashes)
+        {
+            if (_images.Find(hash) is null)
+            {
+                return Failure(400, ApiError.InvalidRequest, "image_hash 未上传");
+            }
+        }
+
+        var requested = body["collection_id"]?.ToString();
+        var collectionId = string.IsNullOrEmpty(requested) ? _collections.ActiveId() : requested;
+        if (string.IsNullOrEmpty(collectionId))
+        {
+            return Failure(409, ApiError.NoActiveCollection, "请在电脑端先新建或选择一个任务合集");
+        }
+
+        if (!_collections.Exists(collectionId))
+        {
+            return Failure(409, ApiError.NoActiveCollection, "所选合集不存在，请重新选择");
+        }
+
+        if (checkQueueDepth)
+        {
+            var queued = _tasks.QueuedCount();
+            if (queued >= _options.MaxQueueDepth)
+            {
+                return Failure(429, ApiError.QueueFull, $"主机任务队列已满（{queued}），请稍后重试", 10);
+            }
+        }
+
+        // 幂等：同一 task_id 直接回既有状态（排队中就再踢一次队列）。
+        var existing = _tasks.Find(taskId);
+        if (existing is not null)
+        {
+            if (existing.Status is TaskStatus.Queued or TaskStatus.Analyzing)
+            {
+                Kick();
+            }
+
+            return Success(existing.Status, existing.SessionId);
+        }
+
+        var sourceDevice = body["source_device"]?.ToString() ?? callerDeviceId;
+        var force = body["force_reanalyze"]?.GetValue<bool>() == true;
+
+        if (!force)
+        {
+            var reusable = _sessions.FindReusableSession(imageHash, hashes);
+            if (reusable is not null)
+            {
+                _tasks.Insert(new TaskRecord(
+                    TaskId: taskId, ImageHash: imageHash, SourceDevice: sourceDevice,
+                    Status: TaskStatus.Done, Attempts: 0, ErrorCode: null, SessionId: reusable,
+                    CreatedAt: _clock.NowMs, StartedAt: null, FinishedAt: _clock.NowMs, PayloadJson: null));
+                return Success(TaskStatus.Done, reusable);
+            }
+        }
+
+        var sessionId = Guid.NewGuid().ToString();
+        _sessions.InsertSession(sessionId, imageHash, sourceDevice, collectionId, _clock.NowMs);
+        for (var i = 0; i < hashes.Count; i++)
+        {
+            _sessions.InsertSessionImage(Guid.NewGuid().ToString(), sessionId, i, hashes[i], _clock.NowMs);
+        }
+
+        var payload = new JsonObject
+        {
+            ["image_hashes"] = new JsonArray([.. hashes.Select(h => (JsonNode)JsonValue.Create(h)!)]),
+            ["collection_id"] = collectionId,
+            ["server_device_id"] = serverDeviceId,
+        };
+
+        _tasks.Insert(new TaskRecord(
+            TaskId: taskId, ImageHash: imageHash, SourceDevice: sourceDevice,
+            Status: TaskStatus.Queued, Attempts: 0, ErrorCode: null, SessionId: sessionId,
+            CreatedAt: _clock.NowMs, StartedAt: null, FinishedAt: null, PayloadJson: payload.ToJsonString()));
+
+        Kick();
+        // 响应报的是**提交那一刻**的状态：新任务是 queued / 0 题，
+        // 不能再去读会话 —— fixture 识别快到可能已经跑完了（实测竞态）。
+        return Success(TaskStatus.Queued, sessionId, questionCount: 0);
+    }
+
+    public JsonObject? TaskView(string taskId)
+    {
+        var task = _tasks.Find(taskId);
+        if (task is null)
+        {
+            return null;
+        }
+
+        var session = task.SessionId is null ? null : _sessions.SessionJson(task.SessionId);
+        return new JsonObject
+        {
+            ["task_id"] = task.TaskId,
+            ["status"] = task.Status,
+            ["session_id"] = task.SessionId,
+            ["error_code"] = task.ErrorCode,
+            // 现状：错误文案取自**会话行**（会话不存在时恒为 null）。
+            ["error_message"] = session?["error_message"]?.ToString(),
+            ["session"] = session,
+        };
+    }
+
+    public bool Retry(string taskId)
+    {
+        if (_tasks.Find(taskId) is null)
+        {
+            return false;
+        }
+
+        if (_tasks.Retry(taskId))
+        {
+            Kick();
+        }
+
+        return true;
+    }
+
+    /// <summary>重新生成：会话不存在 → null（404）；没有可重跑的图 → false（409）。</summary>
+    public SubmitOutcome? Reanalyze(string sessionId, string callerDeviceId)
+    {
+        var session = _sessions.SessionJson(sessionId);
+        if (session is null)
+        {
+            return null;
+        }
+
+        var hashes = _sessions.PageHashes(sessionId);
+        if (hashes.Count == 0)
+        {
+            var fallback = session["image_hash"]?.ToString();
+            if (!string.IsNullOrEmpty(fallback))
+            {
+                hashes.Add(fallback);
+            }
+        }
+
+        if (hashes.Count == 0 || hashes.Exists(h => _images.Find(h) is null))
+        {
+            return Failure(409, ApiError.InvalidRequest, "原图已不在电脑上，无法重新识别");
+        }
+
+        var body = new JsonObject
+        {
+            ["task_id"] = Guid.NewGuid().ToString(),
+            ["image_hash"] = hashes[0],
+            ["image_hashes"] = new JsonArray([.. hashes.Select(h => (JsonNode)JsonValue.Create(h)!)]),
+            ["source_device"] = callerDeviceId,
+            ["collection_id"] = session["collection_id"]?.ToString(),
+            ["force_reanalyze"] = true,
+        };
+
+        var outcome = SubmitCore(body, callerDeviceId, callerDeviceId, checkQueueDepth: false);
+        if (outcome.Status != 202)
+        {
+            return outcome;
+        }
+
+        // 重新生成的响应体是「202 + task_id + 新 session_id + question_count: null + cached: false」。
+        // 注意：不能把 outcome.Body 里的节点**直接引用**到新对象上 —— System.Text.Json
+        // 的节点只能有一个父节点，那样会在序列化前抛异常（表现为空体 500）。
+        return new SubmitOutcome(202, new JsonObject
+        {
+            ["status"] = outcome.Body["status"]?.ToString(),
+            ["task_id"] = body["task_id"]?.ToString(),
+            ["session_id"] = outcome.Body["session_id"]?.ToString(),
+            ["question_count"] = null,
+            ["cached"] = false,
+        });
+    }
+
+    private SubmitOutcome Success(string status, string? sessionId, int? questionCount = null)
+    {
+        if (questionCount is null && sessionId is not null)
+        {
+            var session = _sessions.SessionJson(sessionId);
+            if (session is not null)
+            {
+                // 注意：`SessionJson` 里的整数是 long（SQLite INTEGER），
+                // 用 GetValue<int>() 会抛（类型不完全匹配）→ 空体 500。
+                questionCount = (int)(session["question_count"]?.GetValue<long>() ?? 0L);
+            }
+        }
+
+        return new SubmitOutcome(202, new JsonObject
+        {
+            ["status"] = status,
+            ["session_id"] = sessionId,
+            ["question_count"] = questionCount,
+            // 复用/已完成一律报 cached=true（客户端据此区分「新分析」与「命中缓存」）。
+            ["cached"] = status == TaskStatus.Done,
+        });
+    }
+
+    private static SubmitOutcome Failure(int status, string code, string message, int? retryAfter = null) =>
+        new(status, ApiError.Body(code, message, retryAfter));
+
+    /// <summary>踢一次队列（不等待）。串行执行用一个整数标志保证：队列并发恒 1。</summary>
+    private void Kick() => _ = RunAsync();
+
+    private async Task RunAsync()
+    {
+        if (Interlocked.CompareExchange(ref _running, 1, 0) != 0)
+        {
+            return; // 已有消费者在跑
+        }
+
+        try
+        {
+            while (true)
+            {
+                var task = _tasks.Dequeue();
+                if (task is null)
+                {
+                    return;
+                }
+
+                await ExecuteAsync(task).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _running, 0);
+        }
+    }
+
+    private async Task ExecuteAsync(TaskRecord task)
+    {
+        var now = _clock.NowMs;
+        _tasks.SetStatus(task.TaskId, TaskStatus.Analyzing, startedAt: now);
+
+        var sessionId = task.SessionId;
+        if (sessionId is null)
+        {
+            _tasks.SetStatus(task.TaskId, TaskStatus.Failed, finishedAt: now, errorCode: ApiError.Internal);
+            return;
+        }
+
+        var hashes = _sessions.PageHashes(sessionId);
+        if (hashes.Count == 0)
+        {
+            hashes.Add(task.ImageHash);
+        }
+
+        var pages = new List<byte[]>();
+        foreach (var hash in hashes)
+        {
+            var bytes = _blobs.Read(hash);
+            if (bytes is null)
+            {
+                _sessions.SetSessionFailed(sessionId, "图片文件缺失", now);
+                _tasks.SetStatus(task.TaskId, TaskStatus.Failed, finishedAt: now, errorCode: ApiError.Internal);
+                return;
+            }
+
+            pages.Add(bytes);
+        }
+
+        try
+        {
+            var outcome = await _analyzer.AnalyzeAsync(pages, CancellationToken.None).ConfigureAwait(false);
+            if (outcome.Questions.Count == 0)
+            {
+                _sessions.SetSessionFailed(sessionId, "没有识别到题目", now);
+                _tasks.SetStatus(task.TaskId, TaskStatus.Failed, finishedAt: now, errorCode: "no_question_found");
+                return;
+            }
+
+            var baseOrdinal = _sessions.NextQuestionOrdinal(sessionId);
+            foreach (var question in outcome.Questions)
+            {
+                _sessions.InsertQuestion(
+                    sessionId,
+                    Guid.NewGuid().ToString(),
+                    question with { Ordinal = baseOrdinal + question.Ordinal },
+                    _clock.NowMs,
+                    task.SourceDevice);
+            }
+
+            _sessions.SetSessionDone(sessionId, outcome.Questions.Count, outcome.FromCache, _clock.NowMs, task.SourceDevice);
+            _tasks.SetStatus(task.TaskId, TaskStatus.Done, finishedAt: _clock.NowMs);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _sessions.SetSessionFailed(sessionId, ex.Message, _clock.NowMs);
+            _tasks.SetStatus(task.TaskId, TaskStatus.Failed, finishedAt: _clock.NowMs, errorCode: ApiError.Internal);
+        }
+    }
+}
+
+/// <summary>任务相关的数值口径（协议冻结值）。</summary>
+public sealed record TaskOptions
+{
+    public int MaxPages { get; init; } = 6;
+
+    public int MaxQueueDepth { get; init; } = 20;
+}

@@ -22,24 +22,24 @@ namespace QuizSync.Server.Tests.Conformance;
 /// **未实现的操作 / 断言 / 字段一律失败**（带「第几步 + 标题」），不许静默跳过 ——
 /// 宁可红着，也不要假的绿。
 ///
-/// 分组开关：本 Host 目前只实现了 `auth.ndjson` 需要的端点，<see cref="SupportedGroups"/>
-/// 之外的向量只做诊断、不生成测试；<see cref="VectorInventory_is_fully_accounted_for"/>
-/// 保证「向量目录里多出一组、或少写一句未实现原因」都会变红。
+/// 分组开关：<see cref="SupportedGroups"/> 里的分组**必须真跑且必须全绿**（只为它们生成测试），
+/// 其余分组只在 <see cref="UnimplementedGroups"/> 里显式声明并写明原因；
+/// <see cref="VectorInventory_is_fully_accounted_for"/> 保证「向量目录里多出一组、
+/// 或悄悄少写一句原因」都会变红。
 /// </summary>
 public sealed class VectorReplayTests
 {
     /// <summary>本 Host 已经实现、因而**必须真跑且必须全绿**的向量分组。</summary>
-    private static readonly string[] SupportedGroups = ["auth.ndjson", "images.ndjson", "errors.ndjson"];
+    private static readonly string[] SupportedGroups = ["auth.ndjson", "images.ndjson", "errors.ndjson", "tasks.ndjson", "sync.ndjson"];
 
     /// <summary>
-    /// 尚未实现的分组：**显式声明 + 一句原因**。原因写的是「差在哪个端点」，
-    /// 逐条实测的失败位置见两种状态的交接说明（`docs`）。
+    /// 尚未实现的分组：**显式声明 + 一句原因**（原因是逐条实测出来的失败位置，
+    /// 不是猜的）。改动这批名单时，必须**真的跑一遍**再写。
+    ///
+    /// 现在为空：v1 兼容层的五组 101 步已全部实测通过。将来 `/api/v2/*` 落地后，
+    /// v2 向量组要在这里显式登记，或者直接加进 <see cref="SupportedGroups"/>。
     /// </summary>
-    private static readonly Dictionary<string, string> UnimplementedGroups = new(StringComparer.Ordinal)
-    {
-        ["sync.ndjson"] = "**1–23 步已实测通过**，第 24 步起要 POST /api/v1/tasks（任务流水线：队列 + 识别结果）",
-        ["tasks.ndjson"] = "整组依赖任务流水线（POST /api/v1/tasks 及其后的 done 态）",
-    };
+    private static readonly Dictionary<string, string> UnimplementedGroups = new(StringComparer.Ordinal);
 
     /// <summary>xUnit 在发现阶段调用：把支持的分组变成一个个测试用例。</summary>
     public static TheoryData<string> Supported_groups()
