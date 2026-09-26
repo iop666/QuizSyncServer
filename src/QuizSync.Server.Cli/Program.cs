@@ -33,202 +33,202 @@ switch (parsed.Command)
         return 0;
 
     case "pair":
-    {
-        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
-        client.DefaultRequestHeaders.Add("X-QS-Control", controlToken);
-        try
         {
-            var json = await client.GetFromJsonAsync<JsonElement>(
-                $"http://127.0.0.1:{options.PreferredPort}/api/v1/pair/code");
-            if (parsed.Json)
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+            client.DefaultRequestHeaders.Add("X-QS-Control", controlToken);
+            try
             {
-                Console.WriteLine(json.GetRawText());
-            }
-            else
-            {
-                var expires = DateTimeOffset
-                    .FromUnixTimeMilliseconds(json.GetProperty("expires_at").GetInt64())
-                    .ToLocalTime();
-                Console.WriteLine($"配对码：{json.GetProperty("code").GetString()}");
-                Console.WriteLine($"有效期至：{expires:yyyy-MM-dd HH:mm:ss}");
-                Console.WriteLine($"配对链接：{json.GetProperty("pair_uri").GetString()}");
-            }
+                var json = await client.GetFromJsonAsync<JsonElement>(
+                    $"http://127.0.0.1:{options.PreferredPort}/api/v1/pair/code");
+                if (parsed.Json)
+                {
+                    Console.WriteLine(json.GetRawText());
+                }
+                else
+                {
+                    var expires = DateTimeOffset
+                        .FromUnixTimeMilliseconds(json.GetProperty("expires_at").GetInt64())
+                        .ToLocalTime();
+                    Console.WriteLine($"配对码：{json.GetProperty("code").GetString()}");
+                    Console.WriteLine($"有效期至：{expires:yyyy-MM-dd HH:mm:ss}");
+                    Console.WriteLine($"配对链接：{json.GetProperty("pair_uri").GetString()}");
+                }
 
-            return 0;
+                return 0;
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+            {
+                Console.Error.WriteLine($"读不到配对码：服务没在 127.0.0.1:{options.PreferredPort} 上跑（{ex.Message}）");
+                return 3;
+            }
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
-        {
-            Console.Error.WriteLine($"读不到配对码：服务没在 127.0.0.1:{options.PreferredPort} 上跑（{ex.Message}）");
-            return 3;
-        }
-    }
 
     case "devices":
-    {
-        using var database = QuizSyncDatabase.Open(Path.Combine(dataDir, "quizsync.db"));
-        var devices = new DeviceRepository(database);
-        if (parsed.Sub == "revoke")
         {
-            if (parsed.Arg is null)
+            using var database = QuizSyncDatabase.Open(Path.Combine(dataDir, "quizsync.db"));
+            var devices = new DeviceRepository(database);
+            if (parsed.Sub == "revoke")
             {
-                Console.Error.WriteLine("用法：devices revoke <device_id>");
-                return 1;
+                if (parsed.Arg is null)
+                {
+                    Console.Error.WriteLine("用法：devices revoke <device_id>");
+                    return 1;
+                }
+
+                devices.Revoke(parsed.Arg, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                Console.WriteLine($"已吊销：{parsed.Arg}");
+                return 0;
             }
 
-            devices.Revoke(parsed.Arg, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-            Console.WriteLine($"已吊销：{parsed.Arg}");
-            return 0;
-        }
+            var rows = devices.List();
+            if (parsed.Json)
+            {
+                var array = new JsonArray();
+                foreach (var d in rows)
+                {
+                    array.Add(new JsonObject
+                    {
+                        ["device_id"] = d.DeviceId,
+                        ["name"] = d.Name,
+                        ["platform"] = d.Platform,
+                        ["paired_at"] = d.PairedAt,
+                        ["revoked"] = d.IsRevoked,
+                    });
+                }
 
-        var rows = devices.List();
-        if (parsed.Json)
-        {
-            var array = new JsonArray();
+                Console.WriteLine(array.ToJsonString());
+                return 0;
+            }
+
+            if (rows.Count == 0)
+            {
+                Console.WriteLine("（还没有已配对设备）");
+                return 0;
+            }
+
             foreach (var d in rows)
             {
-                array.Add(new JsonObject
-                {
-                    ["device_id"] = d.DeviceId,
-                    ["name"] = d.Name,
-                    ["platform"] = d.Platform,
-                    ["paired_at"] = d.PairedAt,
-                    ["revoked"] = d.IsRevoked,
-                });
+                Console.WriteLine($"{d.DeviceId,-24} {d.Name,-16} {d.Platform,-8} {(d.IsRevoked ? "已吊销" : "有效")}");
             }
 
-            Console.WriteLine(array.ToJsonString());
             return 0;
         }
-
-        if (rows.Count == 0)
-        {
-            Console.WriteLine("（还没有已配对设备）");
-            return 0;
-        }
-
-        foreach (var d in rows)
-        {
-            Console.WriteLine($"{d.DeviceId,-24} {d.Name,-16} {d.Platform,-8} {(d.IsRevoked ? "已吊销" : "有效")}");
-        }
-
-        return 0;
-    }
 
     case "config":
-    {
-        using var database = QuizSyncDatabase.Open(Path.Combine(dataDir, "quizsync.db"));
-        var store = new DeviceRepository(database);
-        if (parsed.Sub == "set" && parsed.Arg is not null && parsed.Value is not null)
         {
-            store.SetSetting(parsed.Arg, parsed.Value);
-            Console.WriteLine($"{parsed.Arg} = {parsed.Value}");
-            return 0;
-        }
-
-        if (parsed.Sub == "get" && parsed.Arg is not null)
-        {
-            Console.WriteLine(store.GetSetting(parsed.Arg) ?? "（未设置）");
-            return 0;
-        }
-
-        if (parsed.Json)
-        {
-            Console.WriteLine(new JsonObject
+            using var database = QuizSyncDatabase.Open(Path.Combine(dataDir, "quizsync.db"));
+            var store = new DeviceRepository(database);
+            if (parsed.Sub == "set" && parsed.Arg is not null && parsed.Value is not null)
             {
-                ["data_dir"] = dataDir,
-                ["port"] = options.PreferredPort,
-                ["port_range"] = options.PortRange,
-                ["active_collection_id"] = store.GetSetting("active_collection_id"),
-            }.ToJsonString());
+                store.SetSetting(parsed.Arg, parsed.Value);
+                Console.WriteLine($"{parsed.Arg} = {parsed.Value}");
+                return 0;
+            }
+
+            if (parsed.Sub == "get" && parsed.Arg is not null)
+            {
+                Console.WriteLine(store.GetSetting(parsed.Arg) ?? "（未设置）");
+                return 0;
+            }
+
+            if (parsed.Json)
+            {
+                Console.WriteLine(new JsonObject
+                {
+                    ["data_dir"] = dataDir,
+                    ["port"] = options.PreferredPort,
+                    ["port_range"] = options.PortRange,
+                    ["active_collection_id"] = store.GetSetting("active_collection_id"),
+                }.ToJsonString());
+                return 0;
+            }
+
+            Console.WriteLine($"data_dir = {dataDir}");
+            Console.WriteLine($"active_collection_id = {store.GetSetting("active_collection_id") ?? "（未设置）"}");
+            Console.WriteLine($"pairing.port = {options.PreferredPort}（占用时向上探测到 {options.PreferredPort + options.PortRange - 1}）");
             return 0;
         }
-
-        Console.WriteLine($"data_dir = {dataDir}");
-        Console.WriteLine($"active_collection_id = {store.GetSetting("active_collection_id") ?? "（未设置）"}");
-        Console.WriteLine($"pairing.port = {options.PreferredPort}（占用时向上探测到 {options.PreferredPort + options.PortRange - 1}）");
-        return 0;
-    }
 
     case "doctor":
-    {
-        var checks = new List<(string Name, bool Ok, string Detail)>
+        {
+            var checks = new List<(string Name, bool Ok, string Detail)>
         {
             ("数据目录", true, dataDir),
             ("控制令牌", controlToken.Length == 64, controlToken.Length == 64 ? "已生成（仅本机可用）" : "形态不对"),
         };
 
-        try
-        {
-            using var database = QuizSyncDatabase.Open(Path.Combine(dataDir, "quizsync.db"));
-            var devices = new DeviceRepository(database);
-            checks.Add(("本地库", true, $"schema v{V1Schema.SchemaVersion}，设备 {devices.List().Count} 台"));
-        }
-        catch (Exception ex)
-        {
-            checks.Add(("本地库", false, ex.Message));
-        }
-
-        try
-        {
-            await using var host = await QuizSyncHost.StartAsync(options);
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
-            var health = await client.GetFromJsonAsync<JsonElement>($"{host.BaseUrl}/health");
-            checks.Add(("监听", true, $"{host.BaseUrl}（/health: {health.GetProperty("status").GetString()}）"));
-            checks.Add(("配对码", host.Pairing.Code.Length == 6, host.Pairing.Code));
-        }
-        catch (Exception ex)
-        {
-            checks.Add(("监听", false, ex.Message));
-        }
-
-        var failed = checks.Count(c => !c.Ok);
-        if (parsed.Json)
-        {
-            var array = new JsonArray();
-            foreach (var (name, ok, detail) in checks)
+            try
             {
-                array.Add(new JsonObject { ["check"] = name, ["ok"] = ok, ["detail"] = detail });
+                using var database = QuizSyncDatabase.Open(Path.Combine(dataDir, "quizsync.db"));
+                var devices = new DeviceRepository(database);
+                checks.Add(("本地库", true, $"schema v{V1Schema.SchemaVersion}，设备 {devices.List().Count} 台"));
+            }
+            catch (Exception ex)
+            {
+                checks.Add(("本地库", false, ex.Message));
             }
 
-            Console.WriteLine(array.ToJsonString());
-        }
-        else
-        {
-            foreach (var (name, ok, detail) in checks)
+            try
             {
-                Console.WriteLine($"{(ok ? "OK  " : "FAIL")} {name,-8} {detail}");
+                await using var host = await QuizSyncHost.StartAsync(options);
+                using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+                var health = await client.GetFromJsonAsync<JsonElement>($"{host.BaseUrl}/health");
+                checks.Add(("监听", true, $"{host.BaseUrl}（/health: {health.GetProperty("status").GetString()}）"));
+                checks.Add(("配对码", host.Pairing.Code.Length == 6, host.Pairing.Code));
             }
-        }
+            catch (Exception ex)
+            {
+                checks.Add(("监听", false, ex.Message));
+            }
 
-        return failed == 0 ? 0 : 2;
-    }
+            var failed = checks.Count(c => !c.Ok);
+            if (parsed.Json)
+            {
+                var array = new JsonArray();
+                foreach (var (name, ok, detail) in checks)
+                {
+                    array.Add(new JsonObject { ["check"] = name, ["ok"] = ok, ["detail"] = detail });
+                }
+
+                Console.WriteLine(array.ToJsonString());
+            }
+            else
+            {
+                foreach (var (name, ok, detail) in checks)
+                {
+                    Console.WriteLine($"{(ok ? "OK  " : "FAIL")} {name,-8} {detail}");
+                }
+            }
+
+            return failed == 0 ? 0 : 2;
+        }
 
     case "run":
     default:
-    {
-        try
         {
-            await using var host = await QuizSyncHost.StartAsync(options with { ControlToken = controlToken });
-            Console.WriteLine($"QuizSync Server 已启动：{host.BaseUrl}");
-            Console.WriteLine($"协议 v{ServerOptions.ProtocolVersion}（同时在 /api/v1/* 上提供兼容层）");
-            Console.WriteLine($"配对码：{host.Pairing.Code}（有效期 5 分钟，`pair` 命令可随时再读）");
-            Console.WriteLine("按 Ctrl+C 退出。");
-            var stop = new TaskCompletionSource();
-            Console.CancelKeyPress += (_, e) =>
+            try
             {
-                e.Cancel = true;
-                stop.TrySetResult();
-            };
-            AppDomain.CurrentDomain.ProcessExit += (_, _) => stop.TrySetResult();
-            await stop.Task;
-            return 0;
+                await using var host = await QuizSyncHost.StartAsync(options with { ControlToken = controlToken });
+                Console.WriteLine($"QuizSync Server 已启动：{host.BaseUrl}");
+                Console.WriteLine($"协议 v{ServerOptions.ProtocolVersion}（同时在 /api/v1/* 上提供兼容层）");
+                Console.WriteLine($"配对码：{host.Pairing.Code}（有效期 5 分钟，`pair` 命令可随时再读）");
+                Console.WriteLine("按 Ctrl+C 退出。");
+                var stop = new TaskCompletionSource();
+                Console.CancelKeyPress += (_, e) =>
+                {
+                    e.Cancel = true;
+                    stop.TrySetResult();
+                };
+                AppDomain.CurrentDomain.ProcessExit += (_, _) => stop.TrySetResult();
+                await stop.Task;
+                return 0;
+            }
+            catch (InvalidOperationException ex)
+            {
+                Console.Error.WriteLine($"启动失败：{ex.Message}");
+                return 2;
+            }
         }
-        catch (InvalidOperationException ex)
-        {
-            Console.Error.WriteLine($"启动失败：{ex.Message}");
-            return 2;
-        }
-    }
 }
 
 /// <summary>
