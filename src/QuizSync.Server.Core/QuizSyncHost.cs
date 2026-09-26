@@ -142,6 +142,22 @@ public sealed class QuizSyncHost : IAsyncDisposable
     public string BaseUrl => $"http://127.0.0.1:{Port}";
 
     /// <summary>
+    /// 已注册的**路由模板**（供「每条路由都要有负向鉴权用例」这类机械检查用）。
+    ///
+    /// 加这条的由来：v2 的路由加进来时鉴权中间件只判 `/api/v1/` 前缀，
+    /// 于是 `/api/v2/*` 整段裸奔。人眼盯不住，让测试按路由表逐条打。
+    /// </summary>
+    public IReadOnlyList<string> ApiRoutePatterns => _app.Services
+        .GetRequiredService<EndpointDataSource>()
+        .Endpoints
+        .OfType<RouteEndpoint>()
+        .Select(e => "/" + (e.RoutePattern.RawText ?? string.Empty).TrimStart('/'))
+        .Where(p => p.StartsWith("/api/", StringComparison.Ordinal))
+        .Distinct(StringComparer.Ordinal)
+        .OrderBy(p => p, StringComparer.Ordinal)
+        .ToList();
+
+    /// <summary>
     /// 启动并监听。端口占用时按 <see cref="ServerOptions.PortRange"/> 向上探测；
     /// 全占满则抛 <see cref="InvalidOperationException"/>（**不静默换端口**，
     /// 与 v1 桌面端一致：静默换端口会让二维码里的地址失效）。
