@@ -39,6 +39,12 @@ public sealed class TaskService(
     private readonly TaskOptions _options = options;
     private int _running;
 
+    /// <summary>
+    /// 任务状态变化回调：（任务号，状态，会话号，页数）。宿主把它接到 WS 广播上
+    /// —— 这是「手机提交后能实时看到进度」的唯一出口。
+    /// </summary>
+    public Action<string, string, string?, int>? OnTaskUpdate { get; set; }
+
     public SubmitOutcome Submit(JsonObject body, string callerDeviceId, string serverDeviceId) =>
         SubmitCore(body, callerDeviceId, serverDeviceId, checkQueueDepth: true);
 
@@ -157,6 +163,7 @@ public sealed class TaskService(
             Status: TaskStatus.Queued, Attempts: 0, ErrorCode: null, SessionId: sessionId,
             CreatedAt: _clock.NowMs, StartedAt: null, FinishedAt: null, PayloadJson: payload.ToJsonString()));
 
+        OnTaskUpdate?.Invoke(taskId, TaskStatus.Queued, sessionId, hashes.Count);
         Kick();
         // 响应报的是**提交那一刻**的状态：新任务是 queued / 0 题，
         // 不能再去读会话 —— fixture 识别快到可能已经跑完了（实测竞态）。
@@ -311,11 +318,16 @@ public sealed class TaskService(
     {
         var now = _clock.NowMs;
         _tasks.SetStatus(task.TaskId, TaskStatus.Analyzing, startedAt: now);
+        if (task.SessionId is not null)
+        {
+            OnTaskUpdate?.Invoke(task.TaskId, TaskStatus.Analyzing, task.SessionId, 0);
+        }
 
         var sessionId = task.SessionId;
         if (sessionId is null)
         {
             _tasks.SetStatus(task.TaskId, TaskStatus.Failed, finishedAt: now, errorCode: ApiError.Internal);
+            OnTaskUpdate?.Invoke(task.TaskId, TaskStatus.Failed, null, 0);
             return;
         }
 
@@ -333,6 +345,7 @@ public sealed class TaskService(
             {
                 _sessions.SetSessionFailed(sessionId, "图片文件缺失", now);
                 _tasks.SetStatus(task.TaskId, TaskStatus.Failed, finishedAt: now, errorCode: ApiError.Internal);
+                OnTaskUpdate?.Invoke(task.TaskId, TaskStatus.Failed, sessionId, hashes.Count);
                 return;
             }
 
@@ -346,6 +359,7 @@ public sealed class TaskService(
             {
                 _sessions.SetSessionFailed(sessionId, "没有识别到题目", now);
                 _tasks.SetStatus(task.TaskId, TaskStatus.Failed, finishedAt: now, errorCode: "no_question_found");
+                OnTaskUpdate?.Invoke(task.TaskId, TaskStatus.Failed, sessionId, hashes.Count);
                 return;
             }
 
@@ -362,11 +376,13 @@ public sealed class TaskService(
 
             _sessions.SetSessionDone(sessionId, outcome.Questions.Count, outcome.FromCache, _clock.NowMs, task.SourceDevice);
             _tasks.SetStatus(task.TaskId, TaskStatus.Done, finishedAt: _clock.NowMs);
+            OnTaskUpdate?.Invoke(task.TaskId, TaskStatus.Done, sessionId, hashes.Count);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _sessions.SetSessionFailed(sessionId, ex.Message, _clock.NowMs);
             _tasks.SetStatus(task.TaskId, TaskStatus.Failed, finishedAt: _clock.NowMs, errorCode: ApiError.Internal);
+            OnTaskUpdate?.Invoke(task.TaskId, TaskStatus.Failed, sessionId, hashes.Count);
         }
     }
 }

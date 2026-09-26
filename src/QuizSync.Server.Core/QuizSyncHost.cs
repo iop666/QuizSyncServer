@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net;
+using System.Net.WebSockets;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Builder;
@@ -18,6 +19,10 @@ using QuizSync.Server.Core.Protocol;
 using QuizSync.Server.Core.Storage;
 using QuizSync.Server.Core.Sync;
 using QuizSync.Server.Core.Tasks;
+using QuizSync.Server.Core.Ws;
+
+// 协议里的任务状态叫 TaskStatus，与 System.Threading.Tasks.TaskStatus 撞名 —— 起个别名。
+using TaskStatus = QuizSync.Server.Core.Tasks.TaskStatus;
 
 namespace QuizSync.Server.Core;
 
@@ -91,6 +96,42 @@ public sealed class QuizSyncHost : IAsyncDisposable
     /// 真机上以后换成「派发给 Windows 客户端的 Provider」。
     /// </summary>
     public IAnalyzer Analyzer { get; init; } = new FixtureAnalyzer();
+
+    public WebSocketHub Hub => field ??= new WebSocketHub();
+
+    /// <summary>
+    /// 桌面端切合集后走的就是这里（真实产品入口）：立刻广播 `collection_changed`，
+    /// 客户端不必等下一次轮询。
+    /// </summary>
+    public void NotifyCollectionChanged()
+    {
+        Hub.Broadcast(new JsonObject
+        {
+            ["type"] = "collection_changed",
+            ["collection_id"] = Collections.ActiveId(),
+            ["collection_name"] = ActiveCollectionName(),
+        });
+    }
+
+    /// <summary>当前选中合集的名字（没有选中时 null）。</summary>
+    private string? ActiveCollectionName()
+    {
+        var active = Collections.ActiveId();
+        if (active is null)
+        {
+            return null;
+        }
+
+        foreach (var row in Collections.List())
+        {
+            if (row?["collection_id"]?.ToString() == active)
+            {
+                return row["name"]?.ToString();
+            }
+        }
+
+        return null;
+    }
 
     /// <summary>注入的时钟。**所有时间判定都走它**（回放器要能推进时间）。</summary>
     public IClock Clock { get; private init; } = SystemClock.Instance;
@@ -175,6 +216,58 @@ public sealed class QuizSyncHost : IAsyncDisposable
     /// </summary>
     private void MapPipeline()
     {
+        _app.UseWebSockets();
+
+        // 任务状态 → WS 广播（唯一出口，与 v1 的 `_emitTaskUpdate` 对齐）。
+        Tasks.OnTaskUpdate = (taskId, status, sessionId, imageCount) =>
+        {
+            var count = imageCount;
+            if (count <= 0 && !string.IsNullOrEmpty(sessionId))
+            {
+                count = Sessions.PageHashes(sessionId).Count;
+            }
+
+            var update = new JsonObject
+            {
+                ["type"] = "task_update",
+                ["task_id"] = taskId,
+                ["status"] = status,
+                // v1 里 session_id 为 null 时**键被省略**。
+                ["image_count"] = count,
+            };
+            if (sessionId is not null)
+            {
+                update["session_id"] = sessionId;
+            }
+
+            Hub.Broadcast(update);
+
+            if (status == TaskStatus.Done && sessionId is not null)
+            {
+                var session = Sessions.SessionJson(sessionId);
+                if (session?["deleted_at"] is null && session is not null)
+                {
+                    Hub.Broadcast(new JsonObject
+                    {
+                        ["type"] = "task_result",
+                        ["task_id"] = taskId,
+                        ["session"] = session,
+                    });
+                }
+            }
+            else if (status == TaskStatus.Failed && sessionId is not null)
+            {
+                var session = Sessions.SessionJson(sessionId);
+                Hub.Broadcast(new JsonObject
+                {
+                    ["type"] = "task_failed",
+                    ["task_id"] = taskId,
+                    ["error_code"] = session?["error_code"]?.ToString() ?? ApiError.Internal,
+                    ["message"] = session?["error_message"]?.ToString() ?? "分析失败",
+                });
+            }
+        };
+
         _app.Use(async (context, next) =>
         {
             // 每个响应都带服务端版本（错误响应也带）—— v1 行为，客户端用它做诊断。
@@ -498,10 +591,82 @@ public sealed class QuizSyncHost : IAsyncDisposable
             await context.Response.WriteAsync(JsonSerializer.Serialize(body, Json)).ConfigureAwait(false);
         });
 
-        _app.MapDelete("/api/v1/devices/{id}", (string id) =>
+        _app.MapDelete("/api/v1/devices/{id}", async (string id) =>
         {
             Devices.Revoke(id, Clock.NowMs);
+            // 先推 device_revoked，再关连接（顺序有讲究：反过来的话客户端收不到事件）。
+            await Hub.BroadcastAsync(new JsonObject
+            {
+                ["type"] = "device_revoked",
+                ["device_id"] = id,
+            }).ConfigureAwait(false);
+            await Hub.CloseForAsync(id).ConfigureAwait(false);
             return Results.Json(new JsonObject { ["revoked"] = id }, Json);
+        });
+
+        // `/ws`：同一个端口上的事件推送。握手鉴权只看 Authorization 头，
+        // 且**不参与**版本协商（与 v1 一致）。
+        _app.Map("/ws", async context =>
+        {
+            if (!context.WebSockets.IsWebSocketRequest)
+            {
+                await WriteErrorAsync(context, 400, ApiError.InvalidRequest, "需要 WebSocket 升级").ConfigureAwait(false);
+                return;
+            }
+
+            var auth = Authenticator.Authenticate(context.Request.Headers.Authorization);
+            if (auth.Status is AuthStatus.Missing or AuthStatus.Invalid)
+            {
+                await WriteErrorAsync(context, 401, ApiError.Unauthorized,
+                    auth.Status == AuthStatus.Missing ? "缺少 token" : "token 无效").ConfigureAwait(false);
+                return;
+            }
+
+            if (auth.Status == AuthStatus.Revoked)
+            {
+                await WriteErrorAsync(context, 401, ApiError.Revoked, "设备已被吊销").ConfigureAwait(false);
+                return;
+            }
+
+            var deviceId = auth.DeviceId!;
+            var socket = await context.WebSockets.AcceptWebSocketAsync().ConfigureAwait(false);
+            await Hub.AddAsync(deviceId, socket).ConfigureAwait(false);
+            Devices.Touch(deviceId, Clock.NowMs);
+
+            // hello 自述：协议版本按**兼容层**报 1（老客户端只认 1）。
+            var activeId = Collections.ActiveId();
+            Hub.Send(deviceId, new JsonObject
+            {
+                ["type"] = "hello",
+                ["server_device_id"] = Options.DeviceId,
+                ["protocol_version"] = ProtocolVersion.V1,
+                ["active_collection_id"] = activeId,
+                ["active_collection_name"] = ActiveCollectionName(),
+            });
+
+            var buffer = new byte[8 * 1024];
+            try
+            {
+                while (socket.State == WebSocketState.Open)
+                {
+                    var result = await socket.ReceiveAsync(buffer, context.RequestAborted).ConfigureAwait(false);
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        break;
+                    }
+
+                    // 客户端发来的 hello / pong / ack / push_ops 只读不处理：
+                    // op 推送走 HTTP（v1 行为，向量也钉住了「服务端不发 ops」）。
+                }
+            }
+            catch (WebSocketException)
+            {
+                // 对端断了。
+            }
+            finally
+            {
+                Hub.Remove(deviceId, socket);
+            }
         });
 
         _app.MapGet("/api/v1/devices", () => Results.Json(new JsonObject

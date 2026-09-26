@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net.Http.Headers;
+using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -29,8 +30,9 @@ namespace QuizSync.Server.Tests.Conformance;
 /// </summary>
 public sealed class VectorReplayTests
 {
-    /// <summary>本 Host 已经实现、因而**必须真跑且必须全绿**的向量分组。</summary>
-    private static readonly string[] SupportedGroups = ["auth.ndjson", "images.ndjson", "errors.ndjson", "tasks.ndjson", "sync.ndjson"];
+    /// <summary>本 Host 已经实现、因而**必须真跑且必须全绿**的向量分组（v1 兼容层全集）。</summary>
+    private static readonly string[] SupportedGroups =
+        ["auth.ndjson", "images.ndjson", "tasks.ndjson", "sync.ndjson", "errors.ndjson", "websocket.ndjson"];
 
     /// <summary>
     /// 尚未实现的分组：**显式声明 + 一句原因**（原因是逐条实测出来的失败位置，
@@ -161,6 +163,11 @@ internal sealed class VectorReplay : IAsyncDisposable
     private readonly string _file;
     private readonly Dictionary<string, string> _vars = new(StringComparer.Ordinal);
 
+    /// <summary>当前 WS 连接与它的收件箱（见 <see cref="RunWsAsync"/>）。</summary>
+    private ClientWebSocket? _ws;
+    private readonly List<JsonObject> _wsInbox = [];
+    private volatile bool _wsClosed;
+
     private VectorReplay(QuizSyncHost host, MutableClock clock, HttpClient client, string file)
     {
         _host = host;
@@ -237,6 +244,9 @@ internal sealed class VectorReplay : IAsyncDisposable
             case "poll":
                 await RunPollAsync(where, RequireObject(spec, where, "do.poll"), step.Expect);
                 break;
+            case "ws":
+                await RunWsAsync(where, RequireObject(spec, where, "do.ws"));
+                break;
             default:
                 throw Error($"{where} 用了回放器还没实现的操作：{operation}");
         }
@@ -268,10 +278,226 @@ internal sealed class VectorReplay : IAsyncDisposable
         _clock.Advance(RequireInt(spec["advance_ms"], where, "clock.advance_ms"));
     }
 
-    /// <summary>`server: {"refresh_pairing_code": true}` = UI 上的「刷新」（换码并重置有效期）。</summary>
+    /// <summary>
+    /// WS 操作。**收件箱语义**（与 Dart 参考回放器一致）：到达的消息先进箱子，
+    /// `expect` 取**第一条匹配**的并丢掉它之前的消息 —— 顺序仍被钉住，
+    /// 但不必把每个中间态都写成一步。
+    /// </summary>
+    private async Task RunWsAsync(string where, JsonObject spec)
+    {
+        if (spec["connect"] is JsonValue connectValue)
+        {
+            RejectUnknownKeys(spec, where, "ws", ["connect", "max_ms"]);
+            var auth = connectValue.GetValue<string>();
+            var token = auth == "device"
+                ? Substitute("$token", where)
+                : Substitute("$" + auth["device:".Length..], where);
+            var socket = new ClientWebSocket();
+            socket.Options.SetRequestHeader("Authorization", $"Bearer {token}");
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await socket.ConnectAsync(new Uri($"ws://127.0.0.1:{_host.Port}/ws"), cts.Token);
+
+            _ws = socket;
+            _wsClosed = false;
+            lock (_wsInbox)
+            {
+                _wsInbox.Clear();
+            }
+
+            _ = ReceiveLoopAsync(socket);
+            return;
+        }
+
+        if (spec["send"] is JsonNode message)
+        {
+            RejectUnknownKeys(spec, where, "ws", ["send"]);
+            var socket = _ws ?? throw Error($"{where} 还没连接就 send");
+            var bytes = Encoding.UTF8.GetBytes(Resolve(message, where)!.ToJsonString());
+            await socket.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
+            return;
+        }
+
+        if (spec["close"] is JsonValue closeValue && closeValue.GetValue<bool>())
+        {
+            RejectUnknownKeys(spec, where, "ws", ["close"]);
+            if (_ws is not null)
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                try
+                {
+                    await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "客户端主动关闭", cts.Token);
+                }
+                catch (WebSocketException)
+                {
+                    // 已经断了。
+                }
+
+                _ws = null;
+            }
+
+            return;
+        }
+
+        if (spec["expect"] is JsonObject expected)
+        {
+            var maxMs = OptionalInt(spec, "max_ms", where) ?? 5000;
+            RejectUnknownKeys(spec, where, "ws", ["expect", "max_ms"]);
+            // 期望里的 `$变量` 也要替换（capture 出来的 session_id 等）。
+            var wanted = ResolveObject(expected, where);
+            var deadline = DateTime.UtcNow.AddMilliseconds(maxMs);
+            while (DateTime.UtcNow < deadline)
+            {
+                lock (_wsInbox)
+                {
+                    for (var i = 0; i < _wsInbox.Count; i++)
+                    {
+                        try
+                        {
+                            Match(wanted, _wsInbox[i], $"{where} ws.expect", strictArrays: true);
+                            _wsInbox.RemoveRange(0, i + 1);
+                            return;
+                        }
+                        catch (XunitException)
+                        {
+                            // 不是这条：继续往后找。
+                        }
+                    }
+                }
+
+                await Task.Delay(20);
+            }
+
+            string dump;
+            lock (_wsInbox)
+            {
+                dump = string.Join(" | ", _wsInbox.Select(x => x.ToJsonString()));
+            }
+
+            throw Error($"{where} {maxMs}ms 内没等到期望的 WS 消息：期望 {wanted.ToJsonString()}，收到 {dump}");
+        }
+
+        if (spec["expect_none"] is JsonObject forbidden)
+        {
+            var maxMs = OptionalInt(spec, "max_ms", where) ?? 400;
+            RejectUnknownKeys(spec, where, "ws", ["expect_none", "max_ms"]);
+            var banned = ResolveObject(forbidden, where);
+            var deadline = DateTime.UtcNow.AddMilliseconds(maxMs);
+            while (DateTime.UtcNow < deadline)
+            {
+                lock (_wsInbox)
+                {
+                    foreach (var candidate in _wsInbox)
+                    {
+                        try
+                        {
+                            Match(banned, candidate, $"{where} ws.expect_none", strictArrays: true);
+                        }
+                        catch (XunitException)
+                        {
+                            continue; // 不匹配 = 正是我们要的
+                        }
+
+                        throw Error($"{where} 出现了不该出现的 WS 消息：{candidate.ToJsonString()}");
+                    }
+                }
+
+                await Task.Delay(20);
+            }
+
+            return;
+        }
+
+        if (spec["expect_closed"] is JsonValue closedValue && closedValue.GetValue<bool>())
+        {
+            var maxMs = OptionalInt(spec, "max_ms", where) ?? 3000;
+            RejectUnknownKeys(spec, where, "ws", ["expect_closed", "max_ms"]);
+            var deadline = DateTime.UtcNow.AddMilliseconds(maxMs);
+            while (DateTime.UtcNow < deadline)
+            {
+                if (_wsClosed)
+                {
+                    return;
+                }
+
+                await Task.Delay(20);
+            }
+
+            throw Error($"{where} 期望服务端关闭连接，但 {maxMs}ms 内还活着");
+        }
+
+        throw Error($"{where} 用了回放器不认识的 ws 操作：{spec.ToJsonString()}");
+    }
+
+    private async Task ReceiveLoopAsync(ClientWebSocket socket)
+    {
+        var buffer = new byte[8 * 1024];
+        try
+        {
+            while (socket.State == WebSocketState.Open)
+            {
+                using var ms = new MemoryStream();
+                WebSocketReceiveResult result;
+                do
+                {
+                    result = await socket.ReceiveAsync(buffer, CancellationToken.None);
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        // 服务端发了关闭帧：**必须回一个**，否则它的 CloseAsync
+                        // 会一直等服务端的关闭应答（实测：挂满 HttpClient 的 30 秒超时）。
+                        try
+                        {
+                            await socket.CloseOutputAsync(
+                                WebSocketCloseStatus.NormalClosure, "ack", CancellationToken.None);
+                        }
+                        catch (WebSocketException)
+                        {
+                            // 已经断了。
+                        }
+
+                        _wsClosed = true;
+                        return;
+                    }
+
+                    ms.Write(buffer, 0, result.Count);
+                }
+                while (!result.EndOfMessage);
+
+                try
+                {
+                    var node = JsonNode.Parse(Encoding.UTF8.GetString(ms.ToArray()));
+                    if (node is JsonObject obj)
+                    {
+                        lock (_wsInbox)
+                        {
+                            _wsInbox.Add(obj);
+                        }
+                    }
+                }
+                catch (JsonException)
+                {
+                    // 非 JSON 帧：本协议不发。
+                }
+            }
+        }
+        catch (WebSocketException)
+        {
+            _wsClosed = true;
+        }
+
+        _wsClosed = true;
+    }
+
+    /// <summary>`server: {"refresh_pairing_code": true}` = UI 上的「刷新」（换码并重置有效期）；
+    /// `server: {"collection_changed": true}` = 桌面端切合集后的广播入口。</summary>
     private void RunServer(string where, JsonObject spec)
     {
-        RejectUnknownKeys(spec, where, "server", ["refresh_pairing_code"]);
+        RejectUnknownKeys(spec, where, "server", ["refresh_pairing_code", "collection_changed"]);
+        if (spec["collection_changed"] is JsonValue changed &&
+            changed.TryGetValue<bool>(out var notify) && notify)
+        {
+            _host.NotifyCollectionChanged();
+            return;
+        }
         if (spec["refresh_pairing_code"] is not JsonValue flag ||
             !flag.TryGetValue<bool>(out var refresh) ||
             !refresh)
