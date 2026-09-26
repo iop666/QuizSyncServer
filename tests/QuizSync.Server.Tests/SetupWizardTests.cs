@@ -13,27 +13,17 @@ namespace QuizSync.Server.Tests;
 /// </summary>
 public sealed class SetupWizardTests
 {
+    /// <summary>
+    /// CLI 产物就在测试输出目录里（测试项目直接引用了 CLI 工程，构建顺序有保证）。
+    /// 之前按路径往上找 in/{Release,Debug} —— 那条路找到的是**陈旧二进制**：
+    /// 改了 CLI 却没重建它，用例就会拿旧行为判失败（实测踩过）。
+    /// </summary>
     private static string CliDll()
     {
-        var probe = new DirectoryInfo(AppContext.BaseDirectory);
-        while (probe is not null)
-        {
-            var candidate = Path.Combine(probe.FullName, "src", "QuizSync.Server.Cli", "bin", "Release", "net10.0", "QuizSync.Server.Cli.dll");
-            if (File.Exists(candidate))
-            {
-                return candidate;
-            }
-
-            candidate = Path.Combine(probe.FullName, "src", "QuizSync.Server.Cli", "bin", "Debug", "net10.0", "QuizSync.Server.Cli.dll");
-            if (File.Exists(candidate))
-            {
-                return candidate;
-            }
-
-            probe = probe.Parent;
-        }
-
-        throw new FileNotFoundException("找不到 CLI 产物（先 dotnet build src/QuizSync.Server.Cli）");
+        var path = Path.Combine(AppContext.BaseDirectory, "QuizSync.Server.Cli.dll");
+        return File.Exists(path)
+            ? path
+            : throw new FileNotFoundException($"测试输出目录里没有 CLI 产物：{path}");
     }
 
     private static string Dotnet() => Environment.GetEnvironmentVariable("QS_DOTNET")
