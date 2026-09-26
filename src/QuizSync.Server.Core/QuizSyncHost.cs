@@ -276,7 +276,10 @@ public sealed class QuizSyncHost : IAsyncDisposable
             var path = context.Request.Path.Value ?? string.Empty;
 
             // v1 只豁免这两个路径（`/ws` 走自己的握手鉴权，不经过这里做版本协商）。
-            var exempt = path is "/api/v1/pair" or "/api/v1/info" or "/health";
+            // 本机控制面（`/api/v1/pair/code*`）也不是 LAN 协议：它由**控制令牌**把关，
+            // 不要求设备 Bearer（否则 CLI 得先配对才能读配对码，死循环）。
+            var exempt = path is "/api/v1/pair" or "/api/v1/info" or "/health"
+                or "/api/v1/pair/code" or "/api/v1/pair/code/refresh";
 
             if (!exempt && path.StartsWith("/api/v1/", StringComparison.Ordinal))
             {
@@ -330,6 +333,35 @@ public sealed class QuizSyncHost : IAsyncDisposable
         return null;
     }
 
+    /// <summary>
+    /// 本机控制面的准入：**必须来自回环地址**，且控制令牌对得上（`X-QS-Control` 头）。
+    /// 不满足就回 403 `forbidden`（与独立服务端 v1 同码）。未配置控制令牌 = 不开放。
+    /// </summary>
+    private async Task<bool> RequireControlAsync(HttpContext context)
+    {
+        var remote = context.Connection.RemoteIpAddress;
+        var loopback = remote is not null && System.Net.IPAddress.IsLoopback(remote);
+        if (!loopback)
+        {
+            await WriteErrorAsync(context, 403, "forbidden", "只允许本机调用").ConfigureAwait(false);
+            return false;
+        }
+
+        if (string.IsNullOrEmpty(Options.ControlToken))
+        {
+            await WriteErrorAsync(context, 501, "unavailable", "这个实例没有开放本机控制面").ConfigureAwait(false);
+            return false;
+        }
+
+        if (!string.Equals(context.Request.Headers["X-QS-Control"].ToString(), Options.ControlToken, StringComparison.Ordinal))
+        {
+            await WriteErrorAsync(context, 403, "forbidden", "缺少或错误的控制令牌").ConfigureAwait(false);
+            return false;
+        }
+
+        return true;
+    }
+
     private static async Task WriteErrorAsync(HttpContext context, int status, string code, string message, int? retryAfter = null)
     {
         context.Response.StatusCode = status;
@@ -344,6 +376,47 @@ public sealed class QuizSyncHost : IAsyncDisposable
             Results.Json(ServerInfo.Health(Options, _uptime.Elapsed), Json));
 
         _app.MapGet("/api/v2/info", () => Results.Json(ServerInfo.ForV2(Options), Json));
+
+        // ---- 本机控制面（**不属于 LAN 协议**）----
+        // 只在回环地址 + 控制令牌都对时才服务；否则一律 403 forbidden
+        // （那两个码在 spec/09-errors.md §7.1 里被划到「本机控制面」）。
+        _app.MapGet("/api/v1/pair/code", async context =>
+        {
+            if (!await RequireControlAsync(context).ConfigureAwait(false))
+            {
+                return;
+            }
+
+            context.Response.StatusCode = 200;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(JsonSerializer.Serialize(new JsonObject
+            {
+                ["code"] = Pairing.Code,
+                ["expires_at"] = Pairing.ExpiresAtMs,
+                ["device_id"] = Options.DeviceId,
+                ["device_name"] = Options.ServerName,
+                ["port"] = Port,
+                // 客户端扫这个深链就能配对（二维码里放的就是它）。
+                ["pair_uri"] = $"quizsync://pair?host=127.0.0.1&port={Port}&code={Pairing.Code}",
+            }, Json)).ConfigureAwait(false);
+        });
+
+        _app.MapPost("/api/v1/pair/code/refresh", async context =>
+        {
+            if (!await RequireControlAsync(context).ConfigureAwait(false))
+            {
+                return;
+            }
+
+            var code = Pairing.RefreshCode();
+            context.Response.StatusCode = 200;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(JsonSerializer.Serialize(new JsonObject
+            {
+                ["code"] = code,
+                ["expires_at"] = Pairing.ExpiresAtMs,
+            }, Json)).ConfigureAwait(false);
+        });
 
         // v1 兼容层。
         _app.MapGet("/api/v1/info", () => Results.Json(ServerInfo.ForV1(Options), Json));
